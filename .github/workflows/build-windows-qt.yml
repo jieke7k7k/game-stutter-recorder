@@ -1,0 +1,39 @@
+name: Build Windows exe (Qt)
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile check
+        run: python -m py_compile recorder.py app_qt.py tests/test_regression.py
+      - name: Smoke test analyze sample
+        run: |
+          python recorder.py --analyze tests/sample_presentmon.csv
+          python app_qt.py --analyze tests/sample_presentmon.csv
+      - name: Regression test
+        run: python tests/test_regression.py
+      - name: Version check
+        run: python app_qt.py --version
+      - name: Install PyInstaller and PySide6
+        run: pip install pyinstaller PySide6
+      - name: Build exe
+        run: pyinstaller --onefile --windowed --name GameStutterRecorder app_qt.py
+      - name: List dist
+        run: dir dist
+      - name: Packaged exe version check
+        timeout-minutes: 2
+        run: .\dist\GameStutterRecorder.exe --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GameStutterRecorder-windows
+          path: dist/
