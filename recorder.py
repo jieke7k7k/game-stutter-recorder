@@ -737,6 +737,13 @@ class RecorderApp:
 
 
 def main():
+    # Windows 控制台默认编码可能是 cp1252，打印中文结论会直接崩溃，
+    # GitHub Windows runner 上就因此失败过一次，所以先强制改成 UTF-8。
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
     parser = argparse.ArgumentParser(description="游戏卡顿记录程序")
     parser.add_argument("--analyze", metavar="CSV", help="只分析一个已有的 CSV 文件，不启动界面")
     parser.add_argument("--version", action="store_true", help="显示版本")
