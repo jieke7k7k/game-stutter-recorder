@@ -505,13 +505,21 @@ class SensorRecorder(threading.Thread):
 # ---------------------------------------------------------------- 进程列表（Windows tasklist）
 
 def list_processes():
-    """返回 exe 名列表。Windows 用 tasklist，非 Windows 返回空列表。"""
+    """返回 exe 名列表。Windows 用 tasklist，非 Windows 返回空列表。
+
+    互查 P1-11 修：以前 text=True 用系统 locale 解码，非中文 Windows 上遇到中文 exe 名
+    可能 UnicodeDecodeError，被外层 except 吞掉变成空列表。现在按字节取回，
+    Windows 下用 mbcs、其余用 utf-8，解码失败用 replace 兜底，不再静默空列表。
+    这是 Qt 版对核心的唯一改动，其余逻辑与 v1.0 一致。
+    """
     if sys.platform != "win32":
         return []
     try:
-        r = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True, timeout=10)
+        r = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True, timeout=10)
+        enc = "mbcs" if sys.platform == "win32" else "utf-8"
+        text = r.stdout.decode(enc, errors="replace")
         names = []
-        for line in r.stdout.splitlines():
+        for line in text.splitlines():
             m = re.match(r'"([^"]+\.exe)"', line.strip(), re.IGNORECASE)
             if m and m.group(1) not in names:
                 names.append(m.group(1))
