@@ -1,0 +1,59 @@
+# 互查 v1.2 注：这个文件上传到仓库时必须覆盖
+# .github/workflows/build-windows.yml（同名替换），不能和旧文件并存，
+# 否则两个工作流同时触发、双构建；上传后要确认 workflows 下只有一个文件。
+name: Build Windows exe (Qt)
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile check
+        run: python -m py_compile recorder.py app_qt.py app_wizard.py tests/test_regression.py tests/test_wizard.py
+      - name: Smoke test analyze sample
+        run: |
+          python recorder.py --analyze tests/sample_presentmon.csv
+          python app_qt.py --analyze tests/sample_presentmon.csv
+          python app_wizard.py --analyze tests/sample_presentmon.csv
+      - name: Regression test
+        run: |
+          python tests/test_regression.py
+          python tests/test_wizard.py
+      - name: Version check
+        run: python app_wizard.py --version
+      - name: Download PresentMon from official release
+        # 向导版是单文件：PresentMon 随程序一起打包，用户不用单独下载。
+        # 只从官方 GameTechDev/PresentMon 下载控制台版，不用别的来源；
+        # 校验不过就让构建失败，不要静默打成不带 PresentMon 的包。
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/GameTechDev/PresentMon/releases/download/v2.6.0/PresentMon-2.6.0-x64.exe" -OutFile "PresentMon.exe"
+          if (-not (Test-Path "PresentMon.exe")) { throw "PresentMon.exe download failed" }
+          $size = (Get-Item "PresentMon.exe").Length
+          if ($size -ne 980320) { throw "PresentMon.exe size mismatch: $size" }
+          $head = [System.IO.File]::ReadAllBytes("PresentMon.exe")[0..1]
+          if ($head[0] -ne 0x4D -or $head[1] -ne 0x5A) { throw "PresentMon.exe is not an MZ executable" }
+      - name: Install PyInstaller and PySide6
+        run: pip install pyinstaller PySide6
+      - name: Build exe
+        run: pyinstaller --onefile --windowed --name GameStutterRecorder --add-data "PresentMon.exe;." app_wizard.py
+      - name: List dist
+        run: dir dist
+      - name: Packaged exe version check
+        timeout-minutes: 2
+        # 互查 v1.2 修：只跑不验证等于没验，输出必须含 1.2.0 否则构建失败。
+        run: |
+          $v = .\dist\GameStutterRecorder.exe --version
+          if ($v -notmatch "1.2.0") { throw "packaged exe version mismatch: $v" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GameStutterRecorder-windows
+          path: dist/
