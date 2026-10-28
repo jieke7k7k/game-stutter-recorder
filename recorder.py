@@ -659,7 +659,8 @@ class RecorderApp:
                 f"官方地址：{PRESENTMON_URL}")
             return
         now = datetime.datetime.now()
-        safe_game = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(game).stem)
+        # 互查 v1.2 修（向导版同改）：\w 含中文，中文游戏名不再被压成下划线。
+        safe_game = re.sub(r"[^\w.-]+", "_", Path(game).stem)
         self.session_dir = self.base_dir / "Records" / f"{now.strftime('%Y%m%d-%H%M%S')}-{safe_game}"
         self.session_dir.mkdir(parents=True, exist_ok=True)
         frames_path = self.session_dir / "frames.csv"
