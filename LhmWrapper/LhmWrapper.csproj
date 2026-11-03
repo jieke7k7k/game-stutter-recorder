@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <AssemblyName>LhmWrapper</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Floating 0.9.* so CI restores the latest 0.9.x available on NuGet;
+         if restore fails the build fails honestly instead of silently
+         shipping a wrapper without its library. -->
+    <PackageReference Include="LibreHardwareMonitorLib" Version="0.9.*" />
+    <!-- 互查 P0-7 修：net48 不自带 System.Text.Json，必须显式引用 -->
+    <PackageReference Include="System.Text.Json" Version="8.0.*" />
+    <!-- 让 dotnet build 在 Windows runner 上也能编 net48，不依赖本机参考程序集 -->
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies.net48" Version="1.0.3">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+</Project>
