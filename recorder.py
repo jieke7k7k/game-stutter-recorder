@@ -9,8 +9,10 @@
   2. 程序在后台做两件事：
      - 调用 PresentMon（Intel 官方开源工具，ETW 外部采集，不注入游戏）
        逐帧记录帧时间、GPU Busy，带时间戳；
-     - 每 1 秒采一次系统数据：CPU 占用、内存占用、
-       有 nvidia-smi 时再采 GPU 温度、功耗、频率、占用、显存。
+     - 每 250 毫秒采一次系统数据：CPU 占用、内存占用、
+       GPU 温度、功耗、频率、占用、显存（v1.3 起优先用 NVML 直读，
+       不再每 250ms 起 nvidia-smi 子进程），以及 PDH 计数器
+       （CPU 频率百分比、内存硬错误、磁盘延迟、DPC 占比）。
   3. 你打完点“停止并分析”，程序自动把两份数据对齐，
      给出一句中文结论（例如“这次卡顿最像内存快满了”）并附上证据，
      自动在浏览器里打开报告。
@@ -149,7 +151,7 @@ def parse_frames(headers, rows):
         if _is_nan(ft) or ft <= 0 or ft > 1000:
             continue
         frames.append({
-            "idx": idx, "ft": ft, "fps": fps,
+            "idx": idx, "frame_index": len(frames), "ft": ft, "fps": fps,
             "t": get(time_col) if time_col >= 0 else float("nan"),
             "gpu_busy": get(gpu_busy_col) if gpu_busy_col >= 0 else float("nan"),
             "gpu_load": get(gpu_load_col) if gpu_load_col >= 0 else float("nan"),
@@ -166,34 +168,123 @@ def parse_frames(headers, rows):
 
 
 def parse_sensors(headers, rows):
-    """解析本程序自己写的 sensors.csv，返回按 elapsed 秒排序的列表。"""
+    """解析本程序自己写的 sensors.csv，返回按 elapsed 秒排序的列表。
+
+    v1.3 修（显存断流）：以前只读 GPU_Memory_Used_MB、不读 Total，
+    结论层拿不到显存百分比。现在同时读 Total，逐行算 vram_pct；
+    老文件没有 Total 列时 vram_pct 为空，不编造。
+    """
     elapsed_col = _find_col(headers, [lambda h: "elapsedsec" in h])
     mem_col = _find_col(headers, [lambda h: "memory_load_pct" in h or "memoryload" in h])
     gpu_temp_col = _find_col(headers, [lambda h: "gpu_temp_c" in h or "gputemp" in h])
     gpu_clock_col = _find_col(headers, [lambda h: "gpu_clock_mhz" in h or "gpucoreclock" in h])
     gpu_load_col = _find_col(headers, [lambda h: "gpu_load_pct" in h or "gpucoreload" in h])
     gpu_mem_col = _find_col(headers, [lambda h: "gpu_memory_used_mb" in h])
+    gpu_mem_total_col = _find_col(headers, [lambda h: "gpu_memory_total_mb" in h])
+    gpu_power_col = _find_col(headers, [lambda h: "gpu_power_w" in h or "gpupower" in h])
+    vram_pct_col = _find_col(headers, [lambda h: "vram_pct" in h])
+    pdh_cpu_col = _find_col(headers, [lambda h: "pdh_cpu_perf_pct" in h])
+    pdh_dpc_col = _find_col(headers, [lambda h: "pdh_dpc_pct" in h])
+    pdh_fault_col = _find_col(headers, [lambda h: "pdh_page_faults" in h])
+    pdh_disk_col = _find_col(headers, [lambda h: "pdh_disk_sec" in h])
     out = []
     for r in rows:
         def get(col):
             return _num(r[col]) if 0 <= col < len(r) else float("nan")
+        used = get(gpu_mem_col) if gpu_mem_col >= 0 else float("nan")
+        total = get(gpu_mem_total_col) if gpu_mem_total_col >= 0 else float("nan")
+        pct = get(vram_pct_col) if vram_pct_col >= 0 else float("nan")
+        if _is_nan(pct) and not _is_nan(used) and not _is_nan(total) and total > 0:
+            pct = used / total * 100.0
         out.append({
             "elapsed": get(elapsed_col) if elapsed_col >= 0 else float("nan"),
             "mem": get(mem_col) if mem_col >= 0 else float("nan"),
             "gpu_temp": get(gpu_temp_col) if gpu_temp_col >= 0 else float("nan"),
             "gpu_clock": get(gpu_clock_col) if gpu_clock_col >= 0 else float("nan"),
             "gpu_load": get(gpu_load_col) if gpu_load_col >= 0 else float("nan"),
-            "gpu_mem_used": get(gpu_mem_col) if gpu_mem_col >= 0 else float("nan"),
+            "gpu_mem_used": used,
+            "gpu_mem_total": total,
+            "vram_pct": pct,
+            "gpu_power": get(gpu_power_col) if gpu_power_col >= 0 else float("nan"),
+            "pdh_cpu_perf": get(pdh_cpu_col) if pdh_cpu_col >= 0 else float("nan"),
+            "pdh_dpc": get(pdh_dpc_col) if pdh_dpc_col >= 0 else float("nan"),
+            "pdh_faults": get(pdh_fault_col) if pdh_fault_col >= 0 else float("nan"),
+            "pdh_disk_sec": get(pdh_disk_col) if pdh_disk_col >= 0 else float("nan"),
         })
     return [s for s in out if not _is_nan(s["elapsed"])]
 
 
+def _window_stats(sensors, center, lo=-1.0, hi=0.5):
+    """取卡顿峰值前后 [center+lo, center+hi] 窗口内的传感器统计。
+
+    v1.3 对齐：不用最近单点，窗口内无样本就返回 None，不拿几秒前的
+    旧数据硬拼。返回 dict 或 None。
+    """
+    if not sensors or _is_nan(center):
+        return None
+    win = [s for s in sensors if center + lo <= s["elapsed"] <= center + hi]
+    if not win:
+        return None
+    def _max(key):
+        vals = [s[key] for s in win if not _is_nan(s.get(key, float("nan")))]
+        return max(vals) if vals else float("nan")
+    def _min(key):
+        vals = [s[key] for s in win if not _is_nan(s.get(key, float("nan")))]
+        return min(vals) if vals else float("nan")
+    def _mean(key):
+        vals = [s[key] for s in win if not _is_nan(s.get(key, float("nan")))]
+        return sum(vals) / len(vals) if vals else float("nan")
+    def _mean_of(lst, key):
+        vals = [s[key] for s in lst if not _is_nan(s.get(key, float("nan")))]
+        return sum(vals) / len(vals) if vals else float("nan")
+    # 卡顿前 2 秒均值（惩罚信号：GPU 负载下跌用）
+    # 注意：_mean() 只算窗口内，prior 必须用 _mean_of 算 prior 列表，
+    # 否则 prior_load 会被误写成窗口均值（测试暴露的旧 bug）。
+    prior = [s for s in sensors if center + lo - 2.0 <= s["elapsed"] < center + lo]
+    prior_load = _mean_of(prior, "gpu_load") if prior else float("nan")
+    # 卡顿前 3 秒的显存（爬升斜率用）
+    before = [s for s in sensors if center - 3.0 <= s["elapsed"] < center + lo]
+    before_vram = _mean_of(before, "vram_pct") if before else float("nan")
+    win_vram = _max("vram_pct")
+    # 互查 P0-2 修：GPU 下跌不是单点最低值，而是窗口内满足
+    # load < prior_mean - 15 的样本占比 ≥40% 才算下跌，避免单点抖动误判。
+    _loads = [s["gpu_load"] for s in win if not _is_nan(s.get("gpu_load", float("nan")))]
+    _drop_n = sum(1 for v in _loads if not _is_nan(prior_load) and v < prior_load - 15.0)
+    _drop_ratio = (_drop_n / len(_loads)) if _loads else 0.0
+    _vrams = [s["vram_pct"] for s in win if not _is_nan(s.get("vram_pct", float("nan")))]
+    _vram_span = (max(_vrams) - min(_vrams)) if _vrams else float("nan")
+    return {
+        "vram_pct": win_vram,
+        "vram_span": _vram_span,
+        "gpu_load_min": _min("gpu_load"),
+        "gpu_load_mean": _mean("gpu_load"),
+        "prior_gpu_load_mean": prior_load,
+        "gpu_drop": _drop_ratio >= 0.4,
+        "gpu_drop_ratio": _drop_ratio,
+        "vram_climb": (not _is_nan(before_vram) and not _is_nan(win_vram)
+                       and win_vram - before_vram >= 3.0),
+        "mem_max": _max("mem"),
+        "pdh_dpc_max": _max("pdh_dpc"),
+        "pdh_cpu_perf_min": _min("pdh_cpu_perf"),
+        "pdh_faults_max": _max("pdh_faults"),
+        "pdh_disk_sec_max": _max("pdh_disk_sec"),
+    }
+
+
 # ---------------------------------------------------------------- 诊断逻辑
 
-def classify(evidence):
-    """evidence: dict，含 mem/gpu_temp/cpu_temp/gpu_busy_ratio/gpu_load/gpu_clock/med_clock/gpu_mem。
-    返回 (原因, 证据一句话)。顺序是刻意排过的：内存和温度先于频率小波动，
-    因为 GPU 频率在正常 boost 范围内本来就会上下浮动，不能一掉就判降频。"""
+def classify(evidence, allow_vram_strong=True):
+    """v1.3 优先级（Argon + 用户定版）：温度降频 > 显存+内存双满 >
+    纯显存溢出 > 纯系统内存 > GPU/CPU 算力瓶颈 > 温度偏高 > GPU 频率掉落。
+
+    evidence 除旧字段外新增：vram_pct（传感器窗口最大值，优先于
+    旧 gpu_mem 百分比）、gpu_drop、vram_climb、ram_co_pressure。
+    关键：静态显存高 alone 不判显存。纯显存溢出必须带惩罚信号
+    （GPU 负载下跌、或系统内存 ≥85%、或显存 3 秒爬升 ≥3%），
+    否则高显存 + GPU 满载应判算力瓶颈，不是爆显存。
+    allow_vram_strong=False 时（本局有效卡顿 <3 次，或卡顿在开局
+    前 15 秒内），显存强判定降级，不硬判。
+    """
     mem = evidence.get("mem", float("nan"))
     gpu_temp = evidence.get("gpu_temp", float("nan"))
     cpu_temp = evidence.get("cpu_temp", float("nan"))
@@ -202,21 +293,47 @@ def classify(evidence):
     gpu_clock = evidence.get("gpu_clock", float("nan"))
     med_clock = evidence.get("med_clock", float("nan"))
     gpu_mem = evidence.get("gpu_mem", float("nan"))
+    vram = evidence.get("vram_pct", float("nan"))
+    if _is_nan(vram):
+        vram = gpu_mem
+    gpu_drop = bool(evidence.get("gpu_drop", False))
+    vram_climb = bool(evidence.get("vram_climb", False))
+    ram_high = (not _is_nan(mem) and mem >= 85)
+    pdh_dpc = evidence.get("pdh_dpc", float("nan"))
+    vram_span = evidence.get("vram_span", float("nan"))
+    gpu_load_mean = evidence.get("gpu_load_mean", float("nan"))
 
-    if not _is_nan(mem) and mem >= 95:
-        return "内存快满了", "卡顿那一刻内存占用在 95% 以上"
     if (not _is_nan(gpu_temp) and gpu_temp >= 85) or (not _is_nan(cpu_temp) and cpu_temp >= 90):
         return "温度过高，可能降频了", "卡顿那一刻温度已经很高"
+    if not _is_nan(pdh_dpc) and pdh_dpc >= 30:
+        return ("驱动中断（DPC）异常",
+                "卡顿那一刻 CPU 花在驱动中断上的时间占比异常升高，只能定性到 DPC，不能定到具体是哪个驱动文件")
+    if allow_vram_strong and not _is_nan(vram) and vram >= 92 and not _is_nan(mem) and mem >= 88:
+        return ("显存与系统内存同时见底",
+                f"卡顿那一刻显存占用约 {vram:.0f}%，系统内存占用约 {mem:.0f}%，两边同时吃紧；"
+                "整卡满了，暂时分不清具体是哪个进程的显存（按进程查在 DX12 下常返回空，不猜）")
+    # 互查 P0-2 豁免：显存平稳高（窗口内波动 <1%）且 GPU 仍 98% 以上满载
+    # = 算力瓶颈，不判显存；此豁免只挡纯显存分支，双满已在上面先判。
+    if (allow_vram_strong and not _is_nan(vram) and vram >= 92
+            and not _is_nan(vram_span) and vram_span < 1.0
+            and not _is_nan(gpu_load_mean) and gpu_load_mean >= 98):
+        return ("GPU 瓶颈",
+                f"卡顿那一刻显存约 {vram:.0f}% 且波动小于 1%，GPU 仍接近满载，属于算力满载不是爆显存")
+    if (allow_vram_strong and not _is_nan(vram) and vram >= 92
+            and (gpu_drop or ram_high or vram_climb)):
+        return ("显存溢出导致卡顿",
+                f"卡顿那一刻显存占用约 {vram:.0f}%，且伴随 GPU 等待或内存联动信号；"
+                "整卡满了，暂时分不清具体是哪个进程的显存（按进程查在 DX12 下常返回空，不猜）")
+    if not _is_nan(mem) and mem >= 95:
+        return "内存快满了", "卡顿那一刻内存占用在 95% 以上"
+    if not _is_nan(mem) and mem >= 90:
+        return "内存偏高", "卡顿那一刻内存占用在 90% 以上"
     if not _is_nan(busy) and busy < 0.5:
         return "CPU 瓶颈，GPU 没吃饱", "卡顿那一帧 GPU 真正干活的时间不到帧时间的一半"
     if (not _is_nan(busy) and busy >= 0.9) or (not _is_nan(gpu_load) and gpu_load >= 95):
         return "GPU 瓶颈", "卡顿那一刻 GPU 已经接近满载"
-    if not _is_nan(mem) and mem >= 90:
-        return "内存偏高", "卡顿那一刻内存占用在 90% 以上"
     if (not _is_nan(gpu_temp) and gpu_temp >= 80) or (not _is_nan(cpu_temp) and cpu_temp >= 85):
         return "温度偏高", "卡顿那一刻温度已经偏高"
-    if not _is_nan(gpu_mem) and gpu_mem >= 95:
-        return "显存快满了", "卡顿那一刻显存占用在 95% 以上"
     if not _is_nan(gpu_clock) and not _is_nan(med_clock) and med_clock > 0 and gpu_clock < 0.6 * med_clock:
         return "GPU 频率掉了下来", "卡顿那一刻 GPU 频率只有平时的六成以下，不是正常小波动"
     return ("这次数据里看不出明确原因",
@@ -260,16 +377,32 @@ def analyze_frames(frames, sensors=None):
         cum.append(total)
         total += f["ft"] / 1000.0
 
+    # v1.3：显存强判定需要本局有效卡顿 ≥3 次（排除开局前 15 秒），
+    # 先算每一次的 approx_elapsed，再决定每一次是否允许强判定。
     for ev in events:
         peak = ev["peak"]
-        approx_elapsed = cum[peak["idx"]] if peak["idx"] < len(cum) else 0.0
-        ev["approx_elapsed"] = approx_elapsed
-        # 证据：先用帧行自带的数据（旧式 CSV），再用最近的传感器样本补
+        # 互查 P1-3 修：cum 按有效帧顺序建，不能用原始 CSV 行号 idx 索引；
+        # frame_index 才是该帧在有效帧列表里的下标，缺失时回落到 idx。
+        _fi = peak.get("frame_index", peak["idx"])
+        ev["approx_elapsed"] = cum[_fi] if 0 <= _fi < len(cum) else 0.0
+    qualifying = sum(1 for ev in events if ev["approx_elapsed"] >= 15.0)
+    # 录制总时长不足 15 秒时不扣这条（否则短记录永远判不了显存）
+    if total < 15.0:
+        qualifying = len(events)
+
+    for ev in events:
+        peak = ev["peak"]
+        approx_elapsed = ev["approx_elapsed"]
+        # 证据：先用帧行自带的数据（旧式 CSV），再用传感器补
         evidence = {
             "mem": peak["mem"], "gpu_temp": peak["gpu_temp"], "cpu_temp": peak["cpu_temp"],
             "gpu_busy_ratio": (peak["gpu_busy"] / peak["ft"]) if not _is_nan(peak["gpu_busy"]) else float("nan"),
             "gpu_load": peak["gpu_load"], "gpu_clock": peak["gpu_clock"],
             "med_clock": med_clock, "gpu_mem": peak["gpu_mem"],
+            "vram_pct": float("nan"), "vram_span": float("nan"),
+            "gpu_load_mean": float("nan"), "gpu_drop": False, "vram_climb": False,
+            "pdh_dpc": float("nan"), "pdh_cpu_perf_min": float("nan"),
+            "pdh_faults_max": float("nan"), "pdh_disk_sec_max": float("nan"),
         }
         if sensors:
             nearest = min(sensors, key=lambda s: abs(s["elapsed"] - approx_elapsed))
@@ -283,7 +416,25 @@ def analyze_frames(frames, sensors=None):
                 if _is_nan(evidence["gpu_load"]):
                     evidence["gpu_load"] = nearest["gpu_load"]
                 ev["sensor_diff_sec"] = abs(nearest["elapsed"] - approx_elapsed)
-        cause, why = classify(evidence)
+            # v1.3 显存：只用窗口最大值，不用最近单点；窗口无样本则为空
+            win = _window_stats(sensors, approx_elapsed)
+            if win is not None:
+                evidence["vram_pct"] = win["vram_pct"]
+                evidence["vram_span"] = win["vram_span"]
+                evidence["gpu_load_mean"] = win["gpu_load_mean"]
+                evidence["gpu_drop"] = win["gpu_drop"]
+                evidence["vram_climb"] = win["vram_climb"]
+                evidence["pdh_dpc"] = win["pdh_dpc_max"]
+                evidence["pdh_cpu_perf_min"] = win["pdh_cpu_perf_min"]
+                evidence["pdh_faults_max"] = win["pdh_faults_max"]
+                evidence["pdh_disk_sec_max"] = win["pdh_disk_sec_max"]
+                if not _is_nan(win["mem_max"]):
+                    evidence["mem"] = max(evidence["mem"], win["mem_max"]) \
+                        if not _is_nan(evidence["mem"]) else win["mem_max"]
+        allow_vram = qualifying >= 3 and approx_elapsed >= 15.0
+        if total < 15.0:
+            allow_vram = qualifying >= 3
+        cause, why = classify(evidence, allow_vram_strong=allow_vram)
         ev["cause"] = cause
         ev["why"] = why
         ev["evidence"] = evidence
@@ -312,7 +463,23 @@ def analyze_frames(frames, sensors=None):
         "top_cause": top_cause,
         "top_share": top_share,
         "has_sensors": bool(sensors),
+        "blind_spots": _blind_spots(frames, sensors),
     }
+
+
+def _blind_spots(frames, sensors):
+    """报告盲区句：缺失维度明写，不编数据。互查 P1-5 修。"""
+    spots = []
+    if not sensors:
+        spots.append("传感器数据缺失：温度、显存、PDH 计数器均未采到，结论只依据帧数据")
+        return spots
+    if all(_is_nan(s.get("vram_pct", float("nan"))) for s in sensors):
+        spots.append("显存维度未排查：拿不到显存总量或无可用 GPU 驱动，不代表显存正常")
+    if all(_is_nan(s.get("pdh_dpc", float("nan"))) for s in sensors):
+        spots.append("PDH 计数器未采到：DPC、CPU 频率、磁盘延迟维度缺失")
+    if all(_is_nan(s.get("gpu_temp", float("nan"))) for s in sensors):
+        spots.append("GPU 温度未采到")
+    return spots
 
 
 def fmt(x, digits=1):
@@ -350,6 +517,12 @@ def generate_report_html(session_dir, game_name, started_iso, analysis, has_time
         f"<td>{fmt(e['peak']['fps'])}</td><td>{html.escape(e['cause'])}</td></tr>"
         for e in top_events
     ) or "<tr><td colspan='4'>没有检测到卡顿。</td></tr>"
+    _blind = analysis.get("blind_spots") or []
+    blind_section = ""
+    if _blind:
+        _items = "".join(f"<li>{html.escape(s)}</li>" for s in _blind)
+        blind_section = (f"<h2>本次未采到（盲区，不代表正常）</h2>"
+                         f"<div class='box'><ul>{_items}</ul></div>")
     page = f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -369,6 +542,7 @@ td{{padding:10px 8px 10px 0;border-bottom:1px solid #f4f4f5;vertical-align:top}}
 <p class="muted">游戏：{html.escape(game_name)}　开始时间：{html.escape(started_iso)}　记录程序版本：{VERSION}</p>
 <h2>结论：只看这一句</h2>
 <div class="conclusion"><p>{html.escape(main)}</p><p class="muted">{html.escape(note)}</p></div>
+{blind_section}
 <h2>数据一览</h2><div class="box"><table>
 <tr><td style="color:#71717a">总帧数</td><td>{analysis['frame_count']}</td></tr>
 <tr><td style="color:#71717a">平均 FPS</td><td>{fmt(analysis['avg_fps'])}</td></tr>
@@ -474,10 +648,20 @@ def sample_gpu_nvidia_smi():
 
 
 class SensorRecorder(threading.Thread):
-    def __init__(self, out_path, start_monotonic):
+    """v1.3：采样间隔 0.25 秒（原 1 秒），采样放本线程，绝不碰界面线程。
+
+    gpu_sampler / pdh_sampler 为可注入的采样函数（Windows 下由向导版
+    传入 NVML/PDH 实现；不传时回退到 nvidia-smi，Linux 下返回空值）。
+    采样函数抛异常时本行记空，不让记录线程崩掉。
+    """
+    def __init__(self, out_path, start_monotonic, interval=0.25,
+                 gpu_sampler=None, pdh_sampler=None):
         super().__init__(daemon=True)
         self.out_path = Path(out_path)
         self.start_monotonic = start_monotonic
+        self.interval = interval
+        self.gpu_sampler = gpu_sampler
+        self.pdh_sampler = pdh_sampler
         self.stop_event = threading.Event()
         self.sampler = CpuMemSampler()
         self.count = 0
@@ -487,17 +671,47 @@ class SensorRecorder(threading.Thread):
             w = csv.writer(f)
             w.writerow(["Timestamp", "ElapsedSec", "CPU_Load_Pct", "Memory_Load_Pct",
                         "GPU_Temp_C", "GPU_Power_W", "GPU_Clock_MHz", "GPU_Load_Pct",
-                        "GPU_Memory_Used_MB", "GPU_Memory_Total_MB"])
-            while not self.stop_event.wait(1.0):
+                        "GPU_Memory_Used_MB", "GPU_Memory_Total_MB",
+                        "VRAM_Pct", "PDH_CPU_Perf_Pct", "PDH_Page_Faults_Per_Sec",
+                        "PDH_Disk_Sec_Per_Transfer", "PDH_DPC_Pct"])
+            # 互查 P1-9 修：按单调时钟算下一次 deadline，采样耗时不累计；
+            # 落后超过一个间隔就跳到下一个 deadline，不补采。
+            _next = time.monotonic()
+            while True:
+                _now = time.monotonic()
+                if _next > _now:
+                    if self.stop_event.wait(_next - _now):
+                        break
+                else:
+                    _next = _now
+                _next += self.interval
                 cpu_pct, mem_pct = self.sampler.sample()
-                gpu = sample_gpu_nvidia_smi()
+                # 互查 P0-1 修：没有 gpu_sampler 时绝不每 250ms 起 nvidia-smi
+                # 子进程（会自造微卡顿）。调用方须传 NVML 直读或长驻流式采样；
+                # 传 None 就记空，报告盲区里写明显存维度未排查。
+                try:
+                    gpu = self.gpu_sampler() if self.gpu_sampler else {
+                        "temp": float("nan"), "power": float("nan"), "clock": float("nan"),
+                        "load": float("nan"), "mem_used": float("nan"), "mem_total": float("nan")}
+                except Exception:
+                    gpu = {"temp": float("nan"), "power": float("nan"), "clock": float("nan"),
+                           "load": float("nan"), "mem_used": float("nan"), "mem_total": float("nan")}
+                try:
+                    pdh = self.pdh_sampler() if self.pdh_sampler else {}
+                except Exception:
+                    pdh = {}
                 elapsed = time.monotonic() - self.start_monotonic
                 ts = datetime.datetime.now().isoformat(timespec="seconds")
                 def v(x):
-                    return "" if _is_nan(x) else round(float(x), 1)
-                w.writerow([ts, round(elapsed, 1), v(cpu_pct), v(mem_pct),
-                            v(gpu["temp"]), v(gpu["power"]), v(gpu["clock"]), v(gpu["load"]),
-                            v(gpu["mem_used"]), v(gpu["mem_total"])])
+                    return "" if x is None or _is_nan(x) else round(float(x), 1)
+                vram_pct = float("nan")
+                if not _is_nan(gpu.get("mem_used", float("nan"))) and not _is_nan(gpu.get("mem_total", float("nan"))) and gpu["mem_total"] > 0:
+                    vram_pct = gpu["mem_used"] / gpu["mem_total"] * 100.0
+                w.writerow([ts, round(elapsed, 2), v(cpu_pct), v(mem_pct),
+                            v(gpu.get("temp")), v(gpu.get("power")), v(gpu.get("clock")), v(gpu.get("load")),
+                            v(gpu.get("mem_used")), v(gpu.get("mem_total")),
+                            v(vram_pct), v(pdh.get("cpu_perf")), v(pdh.get("page_faults")),
+                            v(pdh.get("disk_sec")), v(pdh.get("dpc"))])
                 f.flush()
                 self.count += 1
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-游戏卡顿记录程序 向导版（v1.2.0）
+游戏卡顿记录程序 向导版（v1.3.0）
 ================================
 用户 2026-10-28 确认的向导单文件版，界面样品：
   workspace/your_files/界面样品-向导版-步骤1.png（浅色/深色）
@@ -21,7 +21,7 @@ PresentMon 查找顺序：exe 旁边的 > 内置的 > 设置里手动选的，
 
 记录和分析逻辑一律复用 recorder.py，不复制、不改核心：
   - PresentMon（ETW 外部采集，不注入游戏）逐帧；
-  - 每 1 秒传感器采样；
+  - 每 250 毫秒传感器采样（NVML 直读 + PDH 计数器，采样在独立线程）；
   - 结论永远是“最可能”，不是百分之百；
   - CPU 温度在 Windows 下不装驱动读不到，不承诺。
 
@@ -48,7 +48,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import recorder
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 # 报告 HTML 里写的是 recorder.VERSION，这里改成向导版的版本号。
 # 直接跑 python recorder.py --analyze 生成的报告仍是 1.0.0-试用版，
 # 那是 Tkinter 版的版本号，不是 bug，三个版本共用一个核心文件。
@@ -82,6 +82,39 @@ SYSTEM_PROCESSES = {
     "ctfmon.exe", "searchhost.exe", "startmenuexperiencehost.exe",
     "textinputhost.exe", "gamestutterrecorder.exe",
 }
+
+
+def is_admin_user():
+    """Windows 下是否已提权；非 Windows 返回 False，不崩溃。"""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def relaunch_elevated():
+    """尝试以管理员身份重起本程序。成功返回 True（调用方应退出原进程）；
+    用户在 UAC 处拒绝时返回 False，调用方继续降级运行，不循环重起。"""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        if getattr(sys, "frozen", False):
+            exe = sys.executable
+            args = " ".join(f'"{a}"' for a in sys.argv[1:])
+        else:
+            # 开发态：exe 是 python.exe，必须把脚本路径也带上，否则重起后
+            # 只会打开一个空 Python 解释器；正式发版是 frozen，不走这支。
+            exe = sys.executable
+            args = f'"{Path(__file__).resolve()}" ' + " ".join(f'"{a}"' for a in sys.argv[1:])
+        # ShellExecuteW runas，返回 >32 表示成功
+        ret = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, args, None, 1)
+        return ret > 32
+    except Exception:
+        return False
 
 
 def _base_name(name):
@@ -258,6 +291,63 @@ def inject_report_dark_css(report_path):
 
 # ---------------------------------------------------------------- 分析（后台线程跑，不碰任何 QWidget）
 
+def resolve_lhm_path(base_dir, bundled=None):
+    """找 LhmWrapper.exe：exe 旁边 > 内置的，三处都没有返回 None。"""
+    candidates = [Path(base_dir) / "LhmWrapper.exe"]
+    if bundled is not None:
+        candidates.append(Path(bundled) / "LhmWrapper.exe")
+    for c in candidates:
+        if c.is_file():
+            return c
+    return None
+
+
+def lhm_snapshot(wrapper_path, timeout=5.0):
+    """跑一次 LHM Wrapper，读第一行 JSON 就杀掉，返回 dict 或 None。
+
+    Wrapper 本身是死循环采样，录制中不跑它（会自造卡顿），只在录前
+    与录后各快照一次。读第一行用线程 + 超时，读不到就杀掉、不阻塞。
+    非 Windows 或文件不存在时返回 None，不崩溃。
+    """
+    if sys.platform != "win32" or wrapper_path is None:
+        return None
+    try:
+        import json as _json
+        import queue as _queue
+        import threading as _th
+        proc = subprocess.Popen([str(wrapper_path)], stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True)
+        q = _queue.Queue()
+        def _read():
+            try:
+                line = proc.stdout.readline()
+                q.put(line)
+            except Exception:
+                q.put("")
+        th = _th.Thread(target=_read, daemon=True)
+        th.start()
+        try:
+            line = q.get(timeout=timeout)
+        except Exception:
+            line = ""
+        try:
+            proc.terminate()
+            proc.wait(timeout=3)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        if not line:
+            return None
+        data = _json.loads(line)
+        if not isinstance(data, dict):
+            return None
+        return data
+    except Exception:
+        return None
+
+
 def _do_analysis(frames_path, sensors_path, session_dir, game, started_iso, sensor_ok=True):
     """纯函数：解析、分析、生成报告、注入深色样式。
 
@@ -282,6 +372,17 @@ def _do_analysis(frames_path, sensors_path, session_dir, game, started_iso, sens
         except Exception:
             sensors = None
     analysis = recorder.analyze_frames(frames, sensors)
+    # v1.3 同游戏历史对比：先取上次同游戏，再存本局，最后拼对比句。
+    try:
+        import history as _history
+        records_dir = Path(session_dir).parent
+        prev = _history.last_same_game(records_dir, game, exclude_latest=False)
+        _history.save_session(records_dir, game, analysis)
+        comp = _history.comparison_sentence(analysis, prev)
+        if comp:
+            analysis["history_comparison"] = comp
+    except Exception:
+        pass
     report = recorder.generate_report_html(session_dir, game, started_iso, analysis, has_timestamp=True)
     inject_report_dark_css(report)
     main, note = recorder.main_conclusion(analysis, has_timestamp=True)
@@ -289,6 +390,28 @@ def _do_analysis(frames_path, sensors_path, session_dir, game, started_iso, sens
                f"1% Low {recorder.fmt(analysis['low1'])} · 卡顿 {len(analysis['events'])} 次")
     if analysis["events"]:
         summary += f" · 其中 {analysis['top_share']}% 是{analysis['top_cause']}"
+    if analysis.get("history_comparison"):
+        summary += (f" · {analysis['history_comparison']}"
+                    "（画质/分辨率若改过，仅供参考）")
+    # v1.3 LHM 快照：录前/录后各一次，只读 CPU 一路，录制中不跑。
+    try:
+        import json as _json
+        _before = _after = None
+        _bf = Path(session_dir) / "lhm_before.json"
+        _af = Path(session_dir) / "lhm_after.json"
+        if _bf.exists():
+            _before = _json.loads(_bf.read_text(encoding="utf-8"))
+        if _af.exists():
+            _after = _json.loads(_af.read_text(encoding="utf-8"))
+        _parts = []
+        if isinstance(_before, dict) and _before.get("temp_c") is not None:
+            _parts.append(f"录前 {_before['temp_c']:.0f}℃")
+        if isinstance(_after, dict) and _after.get("temp_c") is not None:
+            _parts.append(f"录后 {_after['temp_c']:.0f}℃")
+        if _parts:
+            summary += " · CPU 温度（LHM 仅 CPU 一路）：" + "、".join(_parts)
+    except Exception:
+        pass
     return report, main, summary
 
 
@@ -415,13 +538,13 @@ class RecorderWindow:
 
         self.window = _MainWindow(self._on_close)
         self.window.setWindowTitle(f"游戏卡顿记录 {VERSION}")
-        self.window.setFixedSize(700, 720)
+        self.window.setFixedSize(700, 800)
 
         central = QWidget()
         central.setStyleSheet("background: transparent;")
         self.window.setCentralWidget(central)
         root = QVBoxLayout(central)
-        root.setContentsMargins(28, 20, 28, 20)
+        root.setContentsMargins(32, 24, 32, 24)
         root.setSpacing(16)
 
         # 标题行：任务标题 + 主题切换
@@ -471,7 +594,7 @@ class RecorderWindow:
         card = QFrame()
         card.setObjectName("card")
         card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(24, 20, 24, 20)
+        card_layout.setContentsMargins(32, 24, 32, 24)
         card_layout.setSpacing(10)
         self.stack = QStackedWidget()
         self.stack.setStyleSheet("background: transparent;")
@@ -504,6 +627,13 @@ class RecorderWindow:
         self.refresh_btn.setObjectName("link")
         self.refresh_btn.clicked.connect(self.refresh_processes)
         p1.addWidget(self.refresh_btn)
+        self.admin_label = QLabel("")
+        self.admin_label.setObjectName("pill")
+        p1.addWidget(self.admin_label)
+        reminder = QLabel("录前看一眼（只提醒，不改设置）：\n插电源 · 高性能模式 · 独显直连 · 关浏览器\n首局干净测试：帧生成先关")
+        reminder.setObjectName("small")
+        reminder.setWordWrap(True)
+        p1.addWidget(reminder)
         h1 = QLabel("没看到你的游戏？先把游戏打开，再点刷新。")
         h1.setObjectName("small")
         h1.setWordWrap(True)
@@ -530,6 +660,9 @@ class RecorderWindow:
         self.recording_game_label = QLabel("")
         self.recording_game_label.setObjectName("muted")
         p2.addWidget(self.recording_game_label)
+        sampling_label = QLabel("已采：帧时间 + 传感器（250 毫秒一次）")
+        sampling_label.setObjectName("muted")
+        p2.addWidget(sampling_label)
         h2 = QLabel("去玩吧，卡顿不用停，继续玩一会儿再回来。")
         h2.setObjectName("small")
         h2.setWordWrap(True)
@@ -577,7 +710,7 @@ class RecorderWindow:
         self.note_label.setObjectName("muted")
         self.note_label.setWordWrap(True)
         bottom_row.addWidget(self.note_label, 1)
-        settings_link = QPushButton("设置")
+        settings_link = QPushButton("设置（含卸载）")
         settings_link.setObjectName("link")
         settings_link.clicked.connect(self._open_settings)
         bottom_row.addWidget(settings_link)
@@ -652,6 +785,10 @@ class RecorderWindow:
         self.stack.setCurrentIndex(self.step - 1)
         self._refresh_steps()
         if self.step == 1:
+            if is_admin_user():
+                self.admin_label.setText("管理员模式 · 温度与硬盘数据可用")
+            else:
+                self.admin_label.setText("普通权限 · 温度与硬盘数据不可用（可在设置里提权）")
             self.note_label.setText(
                 "PresentMon 已一起装好，不用单独下载 · " + self._f9_note("开始或停止"))
             self.game_combo.setEnabled(True)
@@ -688,7 +825,7 @@ class RecorderWindow:
                 self._pm_exit_noted = True
                 self.note_label.setText("记录进程已退出，正在分析已录到的数据…")
                 from PySide6.QtCore import QTimer
-                QTimer.singleShot(0, self._primary_clicked)
+                QTimer.singleShot(0, lambda: self._primary_clicked(force=True))
 
     def install_hotkey(self):
         """窗口显示后再注册热键（需要窗口句柄），失败只改提示，不弹窗。"""
@@ -739,9 +876,9 @@ class RecorderWindow:
         if not procs and self.step == 1 and not self.recording:
             self.note_label.setText("进程列表读取失败，可手动输入游戏 exe 名。")
 
-    def _primary_clicked(self):
+    def _primary_clicked(self, force=False):
         # 双击误停防护（v1.1 的坑）：开始后 1 秒内忽略停止点击。
-        if self.recording and self.start_monotonic is not None:
+        if not force and self.recording and self.start_monotonic is not None:
             if time.monotonic() - self.start_monotonic < 1.0:
                 return
         if self.analyzing:
@@ -811,6 +948,22 @@ class RecorderWindow:
                                  f"无法写入：{self.session_dir}\n{e}\n\n"
                                  "请把程序移到你有写权限的文件夹，例如桌面或 D 盘。")
             return
+        # v1.3 LHM 录前快照：只跑一次读第一行就杀掉，录制中不跑它。
+        # 成功时写驱动标记，供卸载时判断该不该清 WinRing0；失败不阻塞记录。
+        try:
+            _lhm = resolve_lhm_path(self.base_dir, bundled_dir())
+            _snap = lhm_snapshot(_lhm) if _lhm is not None else None
+            if _snap is not None:
+                import json as _json
+                (self.session_dir / "lhm_before.json").write_text(
+                    _json.dumps(_snap, ensure_ascii=False), encoding="utf-8")
+                try:
+                    (self.base_dir / "lhm_driver_installed.txt").write_text(
+                        "LhmWrapper ran successfully", encoding="utf-8")
+                except Exception:
+                    pass
+        except Exception:
+            pass
         frames_path = self.session_dir / "frames.csv"
         sensors_path = self.session_dir / "sensors.csv"
         cmd = recorder.build_presentmon_command(pm, game, frames_path)
@@ -828,7 +981,33 @@ class RecorderWindow:
         # 传感器启动失败时先杀掉已启动的 PresentMon 再报错，不留孤儿进程（v1.1 的坑）。
         self.start_monotonic = time.monotonic()
         try:
-            self.sensor_thread = recorder.SensorRecorder(sensors_path, self.start_monotonic)
+            # v1.3：Windows 下优先 NVML 直读 + PDH，失败时 SensorRecorder
+            # 内部回退到 nvidia-smi；非 Windows 下 samplers 为 None。
+            _gpu_sampler = None
+            _pdh_sampler = None
+            if sys.platform == "win32":
+                try:
+                    import pdh_nvml as _pn
+                    _nvml = _pn.NVMLSampler()
+                    _pdh = _pn.PDHSampler()
+                    # 互查 P0-1 修：NVML 可用才用直读；不可用时用长驻流式
+                    # nvidia-smi，绝不每 250ms 起子进程；流式也失败才记空。
+                    if getattr(_nvml, "_handle", None) is not None:
+                        _gpu_sampler = _nvml.sample
+                        self._nvml_sampler = _nvml
+                    else:
+                        _stream = _pn.StreamingNvidiaSmiSampler()
+                        if getattr(_stream, "_proc", None) is not None:
+                            _gpu_sampler = _stream.sample
+                            self._stream_sampler = _stream
+                    _pdh_sampler = _pdh.sample
+                    self._pdh_sampler = _pdh
+                except Exception:
+                    _gpu_sampler = None
+                    _pdh_sampler = None
+            self.sensor_thread = recorder.SensorRecorder(
+                sensors_path, self.start_monotonic,
+                gpu_sampler=_gpu_sampler, pdh_sampler=_pdh_sampler)
             self.sensor_thread.start()
         except Exception as e:
             self._stop_processes()
@@ -864,6 +1043,16 @@ class RecorderWindow:
             except Exception:
                 pass
             self.sensor_thread = None
+        # 互查 P1-1 修：先停采样线程、确认线程结束后再关采样器，
+        # 避免线程还在 sample() 时句柄被关掉的竞态。
+        for _attr in ("_nvml_sampler", "_pdh_sampler", "_stream_sampler"):
+            _s = getattr(self, _attr, None)
+            if _s is not None:
+                try:
+                    _s.close()
+                except Exception:
+                    pass
+                setattr(self, _attr, None)
         if self.presentmon_proc is not None:
             try:
                 self.presentmon_proc.terminate()
@@ -888,6 +1077,16 @@ class RecorderWindow:
             return
         self.recording = False
         self._stop_processes()
+        # v1.3 LHM 录后快照：与录前对称，读第一行就杀掉，失败不阻塞分析。
+        try:
+            _lhm = resolve_lhm_path(self.base_dir, bundled_dir())
+            _snap = lhm_snapshot(_lhm) if _lhm is not None else None
+            if _snap is not None and self.session_dir is not None:
+                import json as _json
+                (self.session_dir / "lhm_after.json").write_text(
+                    _json.dumps(_snap, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
         self.analyzing = True
         self._refresh_all()
         self._start_analysis_thread()
@@ -1051,6 +1250,101 @@ class RecorderWindow:
             lambda: webbrowser.open("https://github.com/GameTechDev/PresentMon"))
         layout.addWidget(repo_link)
 
+        # ---- 管理员权限（v1.3，用户定版：首次询问，之后默认提权）----
+        admin_label = QLabel("管理员权限")
+        admin_label.setStyleSheet("font-weight: 700;")
+        layout.addWidget(admin_label)
+        admin_note = QLabel("温度与硬盘数据需要管理员权限。首次运行时会询问一次，"
+                            "之后默认以管理员身份打开；Windows 自己的确认框每次仍会出现，"
+                            "在那里拒绝则当次降级为普通权限，不会崩溃。")
+        admin_note.setObjectName("small")
+        admin_note.setWordWrap(True)
+        layout.addWidget(admin_note)
+        admin_btn = QPushButton()
+        admin_btn.setObjectName("secondary")
+        def _admin_pref_text():
+            pref = self.settings.value("admin_preferred", None)
+            if pref in (True, "true", "True"):
+                return "当前：默认提权（点我改成普通权限）"
+            if pref in (False, "false", "False"):
+                return "当前：普通权限（点我改成默认提权）"
+            return "当前：未设置（首次启动时询问）"
+        admin_btn.setText(_admin_pref_text())
+        def _toggle_admin():
+            pref = self.settings.value("admin_preferred", None)
+            new_pref = False if pref in (True, "true", "True") else True
+            self.settings.setValue("admin_preferred", new_pref)
+            admin_btn.setText(_admin_pref_text())
+        admin_btn.clicked.connect(_toggle_admin)
+        layout.addWidget(admin_btn)
+
+        # ---- 卸载本程序（v1.3，高危操作，按钮写清动作，不用“是/否”）----
+        un_label = QLabel("卸载本程序")
+        un_label.setStyleSheet("font-weight: 700;")
+        layout.addWidget(un_label)
+        un_note = QLabel("卸载会删除程序文件与设置，默认保留你的记录和报告；"
+                        "勾选“全部删除”才会连记录一起删。温度驱动只在它确实是"
+                        "本程序装的情况下才清除，不拆别的软件共用的驱动。")
+        un_note.setObjectName("small")
+        un_note.setWordWrap(True)
+        layout.addWidget(un_note)
+        un_btn = QPushButton("卸载本程序…")
+        un_btn.setObjectName("link")
+        def _do_uninstall():
+            # 互查 P0-6 修：记录中先停进程不分析，分析中不许卸载。
+            if getattr(self, "analyzing", False) or getattr(self, "analysis_thread", None) is not None:
+                from PySide6.QtWidgets import QMessageBox as _MB
+                _MB.warning(dialog, "分析进行中", "分析还没跑完，等分析完成再卸载。")
+                return
+            if getattr(self, "recording", False):
+                self.recording = False
+                try:
+                    self._stop_processes()
+                except Exception:
+                    pass
+            from PySide6.QtWidgets import QCheckBox, QDialog, QMessageBox, QVBoxLayout as _VL
+            import tempfile, subprocess as _sp
+            udlg = QDialog(dialog)
+            udlg.setWindowTitle("卸载本程序")
+            ul = _VL(udlg)
+            ul.setContentsMargins(24, 20, 24, 20)
+            ul.setSpacing(10)
+            ul.addWidget(QLabel("确定要卸载游戏卡顿记录吗？程序文件与设置会被删除。"))
+            cb = QCheckBox("同时删除我的记录和报告（默认不勾，记录会保留）")
+            ul.addWidget(cb)
+            brow = QHBoxLayout()
+            do_btn = QPushButton("卸载并删除程序")
+            do_btn.setObjectName("primary")
+            cancel2 = QPushButton("取消")
+            cancel2.setObjectName("secondary")
+            brow.addWidget(cancel2)
+            brow.addWidget(do_btn)
+            ul.addLayout(brow)
+            def _confirm_uninstall():
+                try:
+                    import uninstall as _un
+                    batch = Path(tempfile.gettempdir()) / "GameStutterRecorder-uninstall.bat"
+                    _un.write_uninstall_batch(self.base_dir, self.base_dir / "Records",
+                                              bool(cb.isChecked()), batch)
+                    # 互查 P0-5 修：cmd /c + 列表传参，空格/中文路径不被拆断。
+                    _kwargs = {}
+                    if sys.platform == "win32" and hasattr(_sp, "CREATE_NO_WINDOW"):
+                        _kwargs["creationflags"] = _sp.CREATE_NO_WINDOW
+                    _sp.Popen(["cmd", "/c", str(batch)], shell=False, **_kwargs)
+                except Exception as e:
+                    QMessageBox.warning(udlg, "卸载失败", f"写卸载脚本失败：{e}")
+                    return
+                udlg.accept()
+                dialog.accept()
+                self.window.close()
+                from PySide6.QtWidgets import QApplication as _QA
+                _QA.instance().quit()
+            do_btn.clicked.connect(_confirm_uninstall)
+            cancel2.clicked.connect(udlg.reject)
+            udlg.exec()
+        un_btn.clicked.connect(_do_uninstall)
+        layout.addWidget(un_btn)
+
         btn_row = QHBoxLayout()
         restore_btn = QPushButton("恢复默认")
         restore_btn.setObjectName("link")
@@ -1159,6 +1453,32 @@ def main():
     if not lock.tryLock():
         QMessageBox.warning(None, "已经在运行", "游戏卡顿记录已经在运行了，不用再开一个。")
         return
+    # v1.3 管理员门：已提权跳过；首次运行弹框说明原因并询问；
+    # 之后按偏好默认提权（UAC 拒绝则当次降级，不循环重起）。
+    if sys.platform == "win32" and not is_admin_user():
+        from PySide6.QtWidgets import QMessageBox
+        from PySide6.QtCore import QSettings as _QS
+        _st = _QS("XiaoMa", "GameStutterRecorder")
+        pref = _st.value("admin_preferred", None)
+        if pref is None:
+            msg = QMessageBox()
+            msg.setWindowTitle("管理员权限")
+            msg.setText("温度与硬盘数据需要管理员权限才能读到。\n\n"
+                        "选“以管理员身份运行”，以后默认按提权方式打开；"
+                        "选“仅普通权限运行”，温度与硬盘那两维会标成未采到，"
+                        "其他功能照常，报告不会因此崩溃。")
+            btn_admin = msg.addButton("以管理员身份运行", QMessageBox.AcceptRole)
+            btn_plain = msg.addButton("仅普通权限运行", QMessageBox.RejectRole)
+            msg.exec()
+            if msg.clickedButton() == btn_admin:
+                _st.setValue("admin_preferred", True)
+                if relaunch_elevated():
+                    return
+            else:
+                _st.setValue("admin_preferred", False)
+        elif pref in (True, "true", "True"):
+            if relaunch_elevated():
+                return
     win = RecorderWindow(app)
     win.window.show()
     # 窗口显示后再注册热键（需要窗口句柄），失败只改提示，不弹窗。
