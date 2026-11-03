@@ -94,11 +94,24 @@ def main():
         check("保留记录时批处理不删程序文件夹", 'rmdir /s /q "' + str(app_dir) + '"' not in text, text)
         check("批处理清注册表", "reg delete" in text)
 
-    # 9. PDH/NVML 在 Linux 下返回空，不崩溃
-    check("PDH Linux 返回空", pdh_nvml.PDHSampler().sample() == {})
+    # 9. PDH/NVML 降级不崩溃（平台相关，互查后修 CI 失败用）
+    # Linux 下返回空；Windows CI 跑在 windows-latest 上，PDH 会返回
+    # 真实数据、NVML/WHEA 也可能有值，所以 Windows 下只断言“字典、
+    # 不崩溃”，不硬断言空值。以前硬断言 Linux 空值导致 CI #28 失败。
     import math as _math
-    check("NVML Linux 返回空显存", _math.isnan(pdh_nvml.NVMLSampler().sample()["mem_total"]))
-    check("WHEA Linux 返回 None", pdh_nvml.whea_snapshot() is None)
+    if sys.platform != "win32":
+        check("PDH Linux 返回空", pdh_nvml.PDHSampler().sample() == {})
+        check("NVML Linux 返回空显存", _math.isnan(pdh_nvml.NVMLSampler().sample()["mem_total"]))
+        check("WHEA Linux 返回 None", pdh_nvml.whea_snapshot() is None)
+    else:
+        _pdh_s = pdh_nvml.PDHSampler().sample()
+        check("PDH Windows 返回字典不崩溃", isinstance(_pdh_s, dict), _pdh_s)
+        _nvml_s = pdh_nvml.NVMLSampler().sample()
+        check("NVML Windows 返回字典含显存键",
+              isinstance(_nvml_s, dict) and "mem_total" in _nvml_s, _nvml_s)
+        _whea = pdh_nvml.whea_snapshot()
+        check("WHEA Windows 返回 None 或计数值",
+              _whea is None or (isinstance(_whea, int) and _whea >= 0), _whea)
     check("SMART 占位返回 None（不编造健康度）", pdh_nvml.smart_snapshot() is None)
 
     # 10. SensorRecorder 250ms 间隔参数可传，不改默认行为之外的接口
