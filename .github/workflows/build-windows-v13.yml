@@ -1,0 +1,70 @@
+# v1.3 工作流：上传到仓库时必须覆盖 .github/workflows/build-windows.yml
+# （同名替换），不能和旧文件并存，否则两个工作流同时触发、双构建；
+# 上传后要确认 workflows 下只有一个文件。
+# 与 v1.2 工作流的区别：编译与回归加了 pdh_nvml/history/uninstall/test_v13；
+# 新增 LHM Wrapper 编译步骤（失败则构建失败，不静默打成无温度驱动的包）；
+# PyInstaller 加了动态本地导入的 hidden-import；版本断言改为 1.3.0。
+name: Build Windows exe (Qt)
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile check
+        run: python -m py_compile recorder.py app_qt.py app_wizard.py pdh_nvml.py history.py uninstall.py tests/test_regression.py tests/test_wizard.py tests/test_v13.py
+      - name: Smoke test analyze sample
+        run: |
+          python recorder.py --analyze tests/sample_presentmon.csv
+          python app_qt.py --analyze tests/sample_presentmon.csv
+          python app_wizard.py --analyze tests/sample_presentmon.csv
+      - name: Regression test
+        run: |
+          python tests/test_regression.py
+          python tests/test_wizard.py
+          python tests/test_v13.py
+      - name: Version check
+        run: |
+          $v = python app_wizard.py --version
+          if ($v -notmatch "1.3.0") { throw "wizard version mismatch: $v" }
+      - name: Download PresentMon from official release
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/GameTechDev/PresentMon/releases/download/v2.6.0/PresentMon-2.6.0-x64.exe" -OutFile "PresentMon.exe"
+          if (-not (Test-Path "PresentMon.exe")) { throw "PresentMon.exe download failed" }
+          $size = (Get-Item "PresentMon.exe").Length
+          if ($size -ne 980320) { throw "PresentMon.exe size mismatch: $size" }
+          $head = [System.IO.File]::ReadAllBytes("PresentMon.exe")[0..1]
+          if ($head[0] -ne 0x4D -or $head[1] -ne 0x5A) { throw "PresentMon.exe is not an MZ executable" }
+      - name: Build LHM Wrapper (CPU only)
+        # dotnet build + ReferenceAssemblies 包可在 Windows runner 上编 net48；
+        # NuGet 还原失败或编译失败都会让构建失败，不会静默跳过温度驱动。
+        run: |
+          dotnet build LhmWrapper/LhmWrapper.csproj -c Release
+          Copy-Item "LhmWrapper/bin/Release/net48/LhmWrapper.exe" -Destination "LhmWrapper.exe"
+          if (-not (Test-Path "LhmWrapper.exe")) { throw "LhmWrapper.exe build failed" }
+          $head = [System.IO.File]::ReadAllBytes("LhmWrapper.exe")[0..1]
+          if ($head[0] -ne 0x4D -or $head[1] -ne 0x5A) { throw "LhmWrapper.exe is not an MZ executable" }
+      - name: Install PyInstaller and PySide6
+        run: pip install pyinstaller PySide6
+      - name: Build exe
+        run: pyinstaller --onefile --windowed --name GameStutterRecorder --add-data "PresentMon.exe;." --add-data "LhmWrapper.exe;." --hidden-import history --hidden-import uninstall --hidden-import pdh_nvml app_wizard.py
+      - name: List dist
+        run: dir dist
+      - name: Packaged exe version check
+        timeout-minutes: 2
+        run: |
+          $v = .\dist\GameStutterRecorder.exe --version
+          if ($v -notmatch "1.3.0") { throw "packaged exe version mismatch: $v" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GameStutterRecorder-windows
+          path: dist/
