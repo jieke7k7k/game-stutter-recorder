@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""向导版 v1.2.0 测试。
+"""向导版 v1.3.0 测试。
 
 跑法：python tests/test_wizard.py
 不依赖 PySide6（app_wizard 顶层不 import Qt，只有 GUI 路径才 import），
@@ -26,7 +26,7 @@ def check(name, cond, detail=""):
 
 def main():
     # 1. 版本
-    check("app_wizard 版本是 1.2.0", app_wizard.VERSION == "1.2.0", app_wizard.VERSION)
+    check("app_wizard 版本是 1.3.0", app_wizard.VERSION == "1.3.0", app_wizard.VERSION)
 
     # 2. 自动选中游戏：过滤系统进程，不默认选第一项
     check("自动选中过滤系统进程后选游戏",
